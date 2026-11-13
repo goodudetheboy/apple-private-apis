@@ -34,6 +34,8 @@ pub enum Error {
     SerdeError(#[from] serde_json::Error),
     #[error("Disable hardware authentication keys and try again!")]
     HardwareKeyError,
+    #[error("Apple returned no trusted phone numbers for SMS verification")]
+    NoTrustedPhoneNumbers,
     #[error("Bad SPD {0}!")]
     BadSpd(String),
 }

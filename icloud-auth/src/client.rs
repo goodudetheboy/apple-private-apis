@@ -237,6 +237,27 @@ pub struct AuthenticationExtras {
     pub repair_phone_number_web_url: Option<String>,
     #[serde(skip)]
     pub new_state: Option<LoginState>,
+    trusted_phone_number: Option<TrustedPhoneNumber>,
+    phone_number: Option<TrustedPhoneNumber>,
+    phone_number_verification: Option<PhoneNumberVerification>,
+    #[serde(default)]
+    service_errors: Vec<ServiceError>,
+    fsa_challenge: Option<serde_json::Value>,
+    key_names: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PhoneNumberVerification {
+    trusted_phone_number: Option<TrustedPhoneNumber>,
+    #[serde(default)]
+    trusted_phone_numbers: Vec<TrustedPhoneNumber>,
+}
+
+#[derive(Deserialize)]
+struct ServiceError {
+    code: String,
+    message: String,
 }
 
 // impl Send2FAToDevices {
@@ -250,6 +271,31 @@ pub struct AuthenticationExtras {
 //         self.account.verify_2fa(&tfa_code).unwrap()
 //     }
 // }
+
+fn parse_auth_extras(resp: &[u8]) -> Result<AuthenticationExtras, Error> {
+    let mut new_state: AuthenticationExtras = serde_json::from_slice(resp)?;
+    if let Some(error) = new_state.service_errors.first() {
+        return Err(Error::AuthSrpWithMessage(error.code.parse().unwrap_or(0), error.message.clone()));
+    }
+    if new_state.trusted_phone_numbers.is_empty() {
+        let verification = new_state.phone_number_verification.take();
+        let numbers = new_state.trusted_phone_number.take().into_iter()
+            .chain(new_state.phone_number.take())
+            .chain(verification.into_iter().flat_map(|v| v.trusted_phone_number.into_iter().chain(v.trusted_phone_numbers)));
+        for number in numbers {
+            if !new_state.trusted_phone_numbers.iter().any(|n| n.id == number.id) {
+                new_state.trusted_phone_numbers.push(number);
+            }
+        }
+    }
+    if new_state.trusted_phone_numbers.is_empty() {
+        if new_state.fsa_challenge.is_some() || new_state.key_names.is_some() {
+            return Err(Error::HardwareKeyError);
+        }
+        return Err(Error::NoTrustedPhoneNumbers);
+    }
+    Ok(new_state)
+}
 
 async fn parse_response(res: Result<Response, reqwest::Error>) -> Result<plist::Dictionary, crate::Error> {
     let res = res?.text().await?;
@@ -931,10 +977,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         }
         let resp = req.bytes().await?;
         info!("Got gsa auth extras {:?}", str::from_utf8(&resp).unwrap());
-        let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
-        if new_state.trusted_phone_numbers.is_empty() {
-            return Err(Error::HardwareKeyError);
-        }
+        let mut new_state = parse_auth_extras(&resp)?;
         if status == 201 {
             new_state.new_state = Some(LoginState::NeedsSMS2FAVerification(VerifyBody {
                 phone_number: PhoneNumber {
@@ -1162,5 +1205,39 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
 
         Ok(headers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NUMBER: &str = r#"{"numberWithDialCode": "+1 (•••) •••-••XX", "lastTwoDigits": "XX", "pushMode": "sms", "id": 1}"#;
+
+    #[test]
+    fn singular_phone_number() {
+        let resp = format!(r#"{{"phoneNumber": {NUMBER}, "mode": "sms", "type": "verification", "noTrustedDevices": true}}"#);
+        let extras = parse_auth_extras(resp.as_bytes()).unwrap();
+        assert_eq!(extras.trusted_phone_numbers.len(), 1);
+        assert_eq!(extras.trusted_phone_numbers[0].id, 1);
+    }
+
+    #[test]
+    fn nested_phone_number_verification_dedupes() {
+        let resp = format!(r#"{{"phoneNumberVerification": {{"trustedPhoneNumber": {NUMBER}, "trustedPhoneNumbers": [{NUMBER}]}}}}"#);
+        assert_eq!(parse_auth_extras(resp.as_bytes()).unwrap().trusted_phone_numbers.len(), 1);
+    }
+
+    #[test]
+    fn service_error_is_surfaced() {
+        let resp = format!(r#"{{"phoneNumber": {NUMBER}, "serviceErrors": [{{"code": "-28248", "title": "Verification Failed",
+            "message": "Verification codes can’t be sent to this phone number at this time. Please try again later."}}]}}"#);
+        assert!(matches!(parse_auth_extras(resp.as_bytes()), Err(Error::AuthSrpWithMessage(-28248, _))));
+    }
+
+    #[test]
+    fn hardware_key_only_when_keys_present() {
+        assert!(matches!(parse_auth_extras(br#"{"trustedPhoneNumbers": []}"#), Err(Error::NoTrustedPhoneNumbers)));
+        assert!(matches!(parse_auth_extras(br#"{"fsaChallenge": {}, "keyNames": ["YubiKey"]}"#), Err(Error::HardwareKeyError)));
     }
 }
